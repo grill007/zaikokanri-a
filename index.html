@@ -1,0 +1,269 @@
+﻿<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>在庫管理A QRスキャン</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --card: #fff;
+      --border: #d9dde5;
+      --text: #111827;
+      --muted: #667085;
+      --ok-bg: #ecfdf5;
+      --ok: #065f46;
+      --err-bg: #fef2f2;
+      --err: #991b1b;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 16px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif;
+    }
+    .version {
+      position: fixed;
+      top: 4px;
+      right: 6px;
+      z-index: 9999;
+      color: #666;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 2px 6px;
+      font-size: 12px;
+    }
+    .card {
+      width: min(100%, 560px);
+      margin: 14px auto;
+      padding: 16px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      box-shadow: 0 6px 16px rgba(0,0,0,.06);
+    }
+    h1 { margin: 0 0 12px; font-size: 22px; }
+    #reader {
+      width: 100%;
+      overflow: hidden;
+      background: #000;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    .qr-value {
+      margin-top: 12px;
+      min-height: 44px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fff;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      word-break: break-all;
+    }
+    .row { display: flex; gap: 10px; margin-top: 12px; }
+    .row > * { flex: 1; }
+    button {
+      width: 100%;
+      min-height: 52px;
+      padding: 10px 12px;
+      border: 0;
+      border-radius: 8px;
+      font-size: 17px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .primary { background: #111827; color: #fff; }
+    .secondary { background: #e5e7eb; color: #111827; }
+    .msg {
+      display: none;
+      margin-top: 12px;
+      padding: 10px 12px;
+      border-radius: 8px;
+      font-size: 15px;
+      white-space: pre-wrap;
+    }
+    .msg.ok { display: block; background: var(--ok-bg); color: var(--ok); border: 1px solid #a7f3d0; }
+    .msg.err { display: block; background: var(--err-bg); color: var(--err); border: 1px solid #fecaca; }
+    .muted { color: var(--muted); font-size: 13px; margin-top: 10px; }
+  </style>
+  <script src="config.js"></script>
+  <script src="https://unpkg.com/html5-qrcode"></script>
+</head>
+<body>
+  <div class="version" id="versionLabel">github-pages-a-2026-06-23-02</div>
+  <div class="card">
+    <h1 id="appTitle">在庫管理A QRスキャン</h1>
+    <div id="reader"></div>
+    <div class="qr-value" id="decodedTextDisplay">未読み取り</div>
+
+    <div class="row">
+      <button id="startButton" class="secondary" type="button">カメラを起動</button>
+    </div>
+    <div class="row">
+      <button id="sendButton" class="primary" type="button" disabled>在庫なしに更新</button>
+      <button id="soundButton" class="secondary" type="button">音: ON</button>
+    </div>
+
+    <div id="messageArea" class="msg"></div>
+    <div id="result" class="muted"></div>
+  </div>
+
+<script>
+const CONFIG = window.ZAIKO_A_CONFIG || {};
+const APP_VERSION = CONFIG.appVersion || 'github-pages-a-2026-06-23-02';
+
+let scanner = null;
+let currentText = '';
+let processing = false;
+let soundEnabled = true;
+let audioCtx = null;
+let jsonpSeq = 0;
+
+const startButton = document.getElementById('startButton');
+const sendButton = document.getElementById('sendButton');
+const soundButton = document.getElementById('soundButton');
+const decodedTextDisplay = document.getElementById('decodedTextDisplay');
+const messageArea = document.getElementById('messageArea');
+const result = document.getElementById('result');
+
+document.getElementById('versionLabel').textContent = APP_VERSION;
+document.getElementById('appTitle').textContent = CONFIG.appName || '在庫管理A QRスキャン';
+
+function setMessage(message, type) {
+  messageArea.className = 'msg ' + (type || 'ok');
+  messageArea.textContent = String(message || '');
+}
+
+function requireGasUrl() {
+  const url = String(CONFIG.gasWebAppUrl || '').trim();
+  if (!url || url.includes('REPLACE_WITH_DEPLOYMENT_ID')) {
+    throw new Error('config.js の gasWebAppUrl を設定してください。');
+  }
+  return url;
+}
+
+async function beep() {
+  if (!soundEnabled) return;
+  try {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') await audioCtx.resume();
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.frequency.value = 1200;
+    gain.gain.value = 0.04;
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    setTimeout(() => osc.stop(), 90);
+  } catch (error) {}
+}
+
+function onScanSuccess(decodedText) {
+  if (processing) return;
+
+  const text = String(decodedText || '').trim();
+  if (!text) {
+    setMessage('QRコードが正しく読み取れませんでした。', 'err');
+    sendButton.disabled = true;
+    return;
+  }
+
+  currentText = text;
+  decodedTextDisplay.textContent = text;
+  result.textContent = '';
+  sendButton.disabled = false;
+  beep();
+}
+
+function onScanFailure() {
+  // 読み取り失敗は連続発生するため画面には出さない。
+}
+
+function startScanner() {
+  if (scanner) return;
+  scanner = new Html5QrcodeScanner('reader', { fps: 10, qrbox: 250 });
+  scanner.render(onScanSuccess, onScanFailure);
+  startButton.disabled = true;
+  startButton.textContent = 'カメラ起動中';
+  setMessage('カメラを起動しました。QRコードを読み取ってください。', 'ok');
+}
+
+function sendJsonp(barcode) {
+  return new Promise((resolve, reject) => {
+    const gasUrl = requireGasUrl();
+    const callbackName = '__zaikoAJsonp' + Date.now() + '_' + (++jsonpSeq);
+    const script = document.createElement('script');
+    const timeoutId = window.setTimeout(() => {
+      cleanup();
+      reject(new Error('GAS APIの応答がタイムアウトしました。'));
+    }, 25000);
+
+    function cleanup() {
+      window.clearTimeout(timeoutId);
+      delete window[callbackName];
+      if (script.parentNode) script.parentNode.removeChild(script);
+    }
+
+    window[callbackName] = data => {
+      cleanup();
+      resolve(data || {});
+    };
+
+    const url = new URL(gasUrl);
+    url.searchParams.set('api', 'saveBarcode');
+    url.searchParams.set('barcode', barcode);
+    url.searchParams.set('token', CONFIG.apiToken || '');
+    url.searchParams.set('callback', callbackName);
+
+    script.onerror = () => {
+      cleanup();
+      reject(new Error('GAS APIを読み込めませんでした。'));
+    };
+    script.src = url.toString();
+    document.body.appendChild(script);
+  });
+}
+
+async function sendBarcode() {
+  if (processing || !currentText) return;
+
+  processing = true;
+  sendButton.disabled = true;
+  setMessage('送信中...', 'ok');
+
+  try {
+    if (scanner) scanner.pause(true);
+  } catch (error) {}
+
+  try {
+    const data = await sendJsonp(currentText);
+    const ok = data.status !== 'error';
+    setMessage(data.message || (ok ? '更新しました。' : '更新に失敗しました。'), ok ? 'ok' : 'err');
+    result.textContent = ok && data.row ? '更新行: ' + data.row : '';
+    currentText = '';
+  } catch (error) {
+    setMessage('送信に失敗しました: ' + (error && error.message ? error.message : error), 'err');
+  } finally {
+    processing = false;
+    sendButton.disabled = true;
+    try {
+      if (scanner) scanner.resume();
+    } catch (error) {}
+  }
+}
+
+startButton.addEventListener('click', startScanner);
+sendButton.addEventListener('click', sendBarcode);
+soundButton.addEventListener('click', async () => {
+  soundEnabled = !soundEnabled;
+  soundButton.textContent = '音: ' + (soundEnabled ? 'ON' : 'OFF');
+  if (soundEnabled) await beep();
+});
+</script>
+</body>
+</html>
+
